@@ -49,7 +49,7 @@ from abc import abstractmethod
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from email.utils import parsedate_to_datetime
 from enum import Enum
 from time import sleep
@@ -954,7 +954,27 @@ class TrinoQuery:
 
         for i, col in enumerate(columns):
             col_values = [row[i] for row in rows]
-            arrays.append(pa.array(col_values, type=schema[i].type))
+            pa_type = schema[i].type
+
+            # Forçar conversão segura
+            if pa.types.is_integer(pa_type):
+                col_values = [int(v) if v is not None else None for v in col_values]
+            elif pa.types.is_floating(pa_type):
+                col_values = [float(v) if v is not None else None for v in col_values]
+            elif pa.types.is_boolean(pa_type):
+                col_values = [bool(v) if v is not None else None for v in col_values]
+            elif pa.types.is_date(pa_type):
+                col_values = [
+                    datetime.fromisoformat(v) if v is not None else None
+                    for v in col_values
+                ]
+            elif pa.types.is_timestamp(pa_type):
+                col_values = [
+                    date.fromisoformat(v) if v is not None else None for v in col_values
+                ]
+            # string e decimal já aceitam o que vem normalmente
+
+            arrays.append(pa.array(col_values, type=pa_type))
 
         return pa.Table.from_arrays(arrays, schema=schema)
 
