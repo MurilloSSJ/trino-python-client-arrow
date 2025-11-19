@@ -10,7 +10,7 @@ from datetime import timedelta
 from datetime import timezone
 from datetime import tzinfo
 from decimal import Decimal
-from typing import Any
+from typing import Any, Union
 from typing import Dict
 from typing import Generic
 from typing import List
@@ -18,7 +18,7 @@ from typing import Optional
 from typing import Tuple
 from typing import TypeVar
 from zoneinfo import ZoneInfo
-
+import pyarrow as pa
 from dateutil.relativedelta import relativedelta
 
 import trino.exceptions
@@ -44,11 +44,13 @@ class BooleanValueMapper(ValueMapper[bool]):
             return None
         if isinstance(value, bool):
             return value
-        if str(value).lower() == 'true':
+        if str(value).lower() == "true":
             return True
-        if str(value).lower() == 'false':
+        if str(value).lower() == "false":
             return False
-        raise ValueError(f"Server sent unexpected value {value} of type {type(value)} for boolean")
+        raise ValueError(
+            f"Server sent unexpected value {value} of type {type(value)} for boolean"
+        )
 
 
 class IntegerValueMapper(ValueMapper[int]):
@@ -65,11 +67,11 @@ class DoubleValueMapper(ValueMapper[float]):
     def map(self, value: Any) -> Optional[float]:
         if value is None:
             return None
-        if value == 'Infinity':
+        if value == "Infinity":
             return float("inf")
-        if value == '-Infinity':
+        if value == "-Infinity":
             return float("-inf")
-        if value == 'NaN':
+        if value == "NaN":
             return float("nan")
         return float(value)
 
@@ -110,57 +112,87 @@ class TimeValueMapper(ValueMapper[time]):
     def map(self, value: Any) -> Optional[time]:
         if value is None:
             return None
-        whole_python_temporal_value = value[:self.time_default_size]
-        remaining_fractional_seconds = value[self.time_default_size + 1:]
-        return Time(
-            time.fromisoformat(whole_python_temporal_value),
-            _fraction_to_decimal(remaining_fractional_seconds)
-        ).round_to(self.precision).to_python_type()
+        whole_python_temporal_value = value[: self.time_default_size]
+        remaining_fractional_seconds = value[self.time_default_size + 1 :]
+        return (
+            Time(
+                time.fromisoformat(whole_python_temporal_value),
+                _fraction_to_decimal(remaining_fractional_seconds),
+            )
+            .round_to(self.precision)
+            .to_python_type()
+        )
 
     def _add_second(self, time_value: time) -> time:
-        return (datetime.combine(datetime(1, 1, 1), time_value) + timedelta(seconds=1)).time()
+        return (
+            datetime.combine(datetime(1, 1, 1), time_value) + timedelta(seconds=1)
+        ).time()
 
 
 class TimeWithTimeZoneValueMapper(TimeValueMapper):
     def map(self, value: Any) -> Optional[time]:
         if value is None:
             return None
-        whole_python_temporal_value = value[:self.time_default_size]
-        remaining_fractional_seconds = value[self.time_default_size + 1:len(value) - 6]
-        timezone_part = value[len(value) - 6:]
-        return TimeWithTimeZone(
-            time.fromisoformat(whole_python_temporal_value).replace(tzinfo=_create_tzinfo(timezone_part)),
-            _fraction_to_decimal(remaining_fractional_seconds),
-        ).round_to(self.precision).to_python_type()
+        whole_python_temporal_value = value[: self.time_default_size]
+        remaining_fractional_seconds = value[
+            self.time_default_size + 1 : len(value) - 6
+        ]
+        timezone_part = value[len(value) - 6 :]
+        return (
+            TimeWithTimeZone(
+                time.fromisoformat(whole_python_temporal_value).replace(
+                    tzinfo=_create_tzinfo(timezone_part)
+                ),
+                _fraction_to_decimal(remaining_fractional_seconds),
+            )
+            .round_to(self.precision)
+            .to_python_type()
+        )
 
 
 class TimestampValueMapper(ValueMapper[datetime]):
     def __init__(self, precision: int):
-        self.datetime_default_size = 19  # size of 'YYYY-MM-DD HH:MM:SS' (the datetime string up to the seconds)
+        self.datetime_default_size = (
+            19  # size of 'YYYY-MM-DD HH:MM:SS' (the datetime string up to the seconds)
+        )
         self.precision = precision
 
     def map(self, value: Any) -> Optional[datetime]:
         if value is None:
             return None
-        whole_python_temporal_value = value[:self.datetime_default_size]
-        remaining_fractional_seconds = value[self.datetime_default_size + 1:]
-        return Timestamp(
-            datetime.fromisoformat(whole_python_temporal_value),
-            _fraction_to_decimal(remaining_fractional_seconds),
-        ).round_to(self.precision).to_python_type()
+        whole_python_temporal_value = value[: self.datetime_default_size]
+        remaining_fractional_seconds = value[self.datetime_default_size + 1 :]
+        return (
+            Timestamp(
+                datetime.fromisoformat(whole_python_temporal_value),
+                _fraction_to_decimal(remaining_fractional_seconds),
+            )
+            .round_to(self.precision)
+            .to_python_type()
+        )
 
 
 class TimestampWithTimeZoneValueMapper(TimestampValueMapper):
     def map(self, value: Any) -> Optional[datetime]:
         if value is None:
             return None
-        datetime_with_fraction, timezone_part = value.rsplit(' ', 1)
-        whole_python_temporal_value = datetime_with_fraction[:self.datetime_default_size]
-        remaining_fractional_seconds = datetime_with_fraction[self.datetime_default_size + 1:]
-        return TimestampWithTimeZone(
-            datetime.fromisoformat(whole_python_temporal_value).replace(tzinfo=_create_tzinfo(timezone_part)),
-            _fraction_to_decimal(remaining_fractional_seconds),
-        ).round_to(self.precision).to_python_type()
+        datetime_with_fraction, timezone_part = value.rsplit(" ", 1)
+        whole_python_temporal_value = datetime_with_fraction[
+            : self.datetime_default_size
+        ]
+        remaining_fractional_seconds = datetime_with_fraction[
+            self.datetime_default_size + 1 :
+        ]
+        return (
+            TimestampWithTimeZone(
+                datetime.fromisoformat(whole_python_temporal_value).replace(
+                    tzinfo=_create_tzinfo(timezone_part)
+                ),
+                _fraction_to_decimal(remaining_fractional_seconds),
+            )
+            .round_to(self.precision)
+            .to_python_type()
+        )
 
 
 def _create_tzinfo(timezone_str: str) -> tzinfo:
@@ -183,7 +215,7 @@ class IntervalYearToMonthMapper(ValueMapper[relativedelta]):
         if value is None:
             return None
         is_negative = value[0] == "-"
-        years, months = (value[1:] if is_negative else value).split('-')
+        years, months = (value[1:] if is_negative else value).split("-")
         years, months = int(years), int(months)
         if is_negative:
             years, months = -years, -months
@@ -195,15 +227,32 @@ class IntervalDayToSecondMapper(ValueMapper[timedelta]):
         if value is None:
             return None
         is_negative = value[0] == "-"
-        days, time = (value[1:] if is_negative else value).split(' ')
-        hours, minutes, seconds_milliseconds = time.split(':')
-        seconds, milliseconds = seconds_milliseconds.split('.')
-        days, hours, minutes, seconds, milliseconds = (int(days), int(hours), int(minutes), int(seconds),
-                                                       int(milliseconds))
+        days, time = (value[1:] if is_negative else value).split(" ")
+        hours, minutes, seconds_milliseconds = time.split(":")
+        seconds, milliseconds = seconds_milliseconds.split(".")
+        days, hours, minutes, seconds, milliseconds = (
+            int(days),
+            int(hours),
+            int(minutes),
+            int(seconds),
+            int(milliseconds),
+        )
         if is_negative:
-            days, hours, minutes, seconds, milliseconds = -days, -hours, -minutes, -seconds, -milliseconds
+            days, hours, minutes, seconds, milliseconds = (
+                -days,
+                -hours,
+                -minutes,
+                -seconds,
+                -milliseconds,
+            )
         try:
-            return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds, milliseconds=milliseconds)
+            return timedelta(
+                days=days,
+                hours=hours,
+                minutes=minutes,
+                seconds=seconds,
+                milliseconds=milliseconds,
+            )
         except OverflowError as e:
             error_str = (
                 f"Could not convert '{value}' into the associated python type, as the value "
@@ -236,7 +285,12 @@ class MapValueMapper(ValueMapper[Dict[Any, Optional[Any]]]):
 
 
 class RowValueMapper(ValueMapper[Tuple[Optional[Any], ...]]):
-    def __init__(self, mappers: List[ValueMapper[Any]], names: List[Optional[str]], types: List[str]):
+    def __init__(
+        self,
+        mappers: List[ValueMapper[Any]],
+        names: List[Optional[str]],
+        types: List[str],
+    ):
         self.mappers = mappers
         self.names = names
         self.types = types
@@ -247,7 +301,7 @@ class RowValueMapper(ValueMapper[Tuple[Optional[Any], ...]]):
         return NamedRowTuple(
             list(self.mappers[i].map(v) for i, v in enumerate(value)),
             self.names,
-            self.types
+            self.types,
         )
 
 
@@ -279,82 +333,101 @@ class RowMapperFactory:
     lambda functions (one for each column) which will process a data value
     and returns a RowMapper instance which will process rows of data
     """
+
     NO_OP_ROW_MAPPER = NoOpRowMapper()
 
-    def create(self, columns: List[Any], legacy_primitive_types: bool) -> RowMapper | NoOpRowMapper:
+    def create(
+        self, columns: List[Any], legacy_primitive_types: bool
+    ) -> RowMapper | NoOpRowMapper:
         assert columns is not None
 
         if not legacy_primitive_types:
-            return RowMapper([self._create_value_mapper(column['typeSignature']) for column in columns])
+            return RowMapper(
+                [
+                    self._create_value_mapper(column["typeSignature"])
+                    for column in columns
+                ]
+            )
         return RowMapperFactory.NO_OP_ROW_MAPPER
 
     def _create_value_mapper(self, column: Dict[str, Any]) -> ValueMapper[Any]:
-        col_type = column['rawType']
+        col_type = column["rawType"]
 
         # primitive types
-        if col_type == 'boolean':
+        if col_type == "boolean":
             return BooleanValueMapper()
-        if col_type in {'tinyint', 'smallint', 'integer', 'bigint'}:
+        if col_type in {"tinyint", "smallint", "integer", "bigint"}:
             return IntegerValueMapper()
-        if col_type in {'double', 'real'}:
+        if col_type in {"double", "real"}:
             return DoubleValueMapper()
-        if col_type == 'decimal':
+        if col_type == "decimal":
             return DecimalValueMapper()
-        if col_type in {'varchar', 'char'}:
+        if col_type in {"varchar", "char"}:
             return StringValueMapper()
-        if col_type == 'varbinary':
+        if col_type == "varbinary":
             return BinaryValueMapper()
-        if col_type == 'json':
+        if col_type == "json":
             return StringValueMapper()
-        if col_type == 'date':
+        if col_type == "date":
             return DateValueMapper()
-        if col_type == 'time':
+        if col_type == "time":
             return TimeValueMapper(self._get_precision(column))
-        if col_type == 'time with time zone':
+        if col_type == "time with time zone":
             return TimeWithTimeZoneValueMapper(self._get_precision(column))
-        if col_type == 'timestamp':
+        if col_type == "timestamp":
             return TimestampValueMapper(self._get_precision(column))
-        if col_type == 'timestamp with time zone':
+        if col_type == "timestamp with time zone":
             return TimestampWithTimeZoneValueMapper(self._get_precision(column))
-        if col_type == 'interval year to month':
+        if col_type == "interval year to month":
             return IntervalYearToMonthMapper()
-        if col_type == 'interval day to second':
+        if col_type == "interval day to second":
             return IntervalDayToSecondMapper()
 
         # structural types
-        if col_type == 'array':
-            value_mapper = self._create_value_mapper(column['arguments'][0]['value'])
+        if col_type == "array":
+            value_mapper = self._create_value_mapper(column["arguments"][0]["value"])
             return ArrayValueMapper(value_mapper)
-        if col_type == 'map':
-            key_mapper = self._create_value_mapper(column['arguments'][0]['value'])
-            value_mapper = self._create_value_mapper(column['arguments'][1]['value'])
+        if col_type == "map":
+            key_mapper = self._create_value_mapper(column["arguments"][0]["value"])
+            value_mapper = self._create_value_mapper(column["arguments"][1]["value"])
             return MapValueMapper(key_mapper, value_mapper)
-        if col_type == 'row':
+        if col_type == "row":
             mappers: List[ValueMapper[Any]] = []
             names: List[Optional[str]] = []
             types: List[str] = []
-            for arg in column['arguments']:
-                mappers.append(self._create_value_mapper(arg['value']['typeSignature']))
-                names.append(arg['value']['fieldName']['name'] if "fieldName" in arg['value'] else None)
-                types.append(arg['value']['typeSignature']['rawType'])
+            for arg in column["arguments"]:
+                mappers.append(self._create_value_mapper(arg["value"]["typeSignature"]))
+                names.append(
+                    arg["value"]["fieldName"]["name"]
+                    if "fieldName" in arg["value"]
+                    else None
+                )
+                types.append(arg["value"]["typeSignature"]["rawType"])
             return RowValueMapper(mappers, names, types)
 
         # others
-        if col_type == 'uuid':
+        if col_type == "uuid":
             return UuidValueMapper()
         return NoOpValueMapper()
 
     def _get_precision(self, column: Dict[str, Any]) -> int:
-        args = column['arguments']
+        args = column["arguments"]
         if len(args) == 0:
             return 3
-        return args[0]['value']
+        return args[0]["value"]
 
 
-class RowMapper:
+class RowMapperInterface(abc.ABC):
+    @abc.abstractmethod
+    def map(self, rows: List[List[Any]]) -> Union[List[List[Any]], pa.Table]:
+        pass
+
+
+class RowMapper(RowMapperInterface):
     """
     Maps a row of data given a list of mapping functions
     """
+
     def __init__(self, columns: List[ValueMapper[Any]]):
         self.columns = columns
 
@@ -364,7 +437,10 @@ class RowMapper:
         return [self._map_row(row) for row in rows]
 
     def _map_row(self, row: List[Any]) -> List[Any]:
-        return [self._map_value(value, self.columns[index]) for index, value in enumerate(row)]
+        return [
+            self._map_value(value, self.columns[index])
+            for index, value in enumerate(row)
+        ]
 
     def _map_value(self, value: Any, value_mapper: ValueMapper[T]) -> Optional[T]:
         try:
@@ -372,3 +448,48 @@ class RowMapper:
         except ValueError as e:
             error_str = f"Could not convert '{value}' into the associated python type"
             raise trino.exceptions.TrinoDataError(error_str) from e
+
+
+class ArrowRowMapper(RowMapperInterface):
+    def __init__(self, columns):
+        # columns é uma lista de dicts do Trino:
+        # [{"name": "col1", "type": "integer"}, ...]
+        self.columns = columns
+        self.schema = self._columns_to_arrow_schema(columns)
+
+    def map(self, rows):
+        if not rows:
+            return pa.Table.from_arrays([], schema=self.schema)
+
+        arrays = []
+        for idx, col in enumerate(self.columns):
+            values = [row[idx] for row in rows]
+            arrays.append(pa.array(values, type=self.schema[idx].type))
+
+        return pa.Table.from_arrays(arrays, schema=self.schema)
+
+    def _columns_to_arrow_schema(self, columns):
+        fields = []
+        for col in columns:
+            type_name = col["type"].lower()
+
+            if type_name in ("boolean",):
+                pa_type = pa.bool_()
+            elif type_name in ("tinyint", "smallint", "integer", "bigint"):
+                pa_type = pa.int64()
+            elif type_name in ("real", "double"):
+                pa_type = pa.float64()
+            elif type_name.startswith("varchar") or type_name == "char":
+                pa_type = pa.string()
+            elif type_name.startswith("decimal"):
+                pa_type = pa.decimal128(38, 18)
+            elif type_name == "date":
+                pa_type = pa.date32()
+            elif type_name.startswith("timestamp"):
+                pa_type = pa.timestamp("us")
+            else:
+                pa_type = pa.string()
+
+            fields.append(pa.field(col["name"], pa_type))
+
+        return pa.schema(fields)
