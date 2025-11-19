@@ -950,10 +950,18 @@ class TrinoQuery:
 
     def _fetch_arrow_batches(self) -> pa.Table:
         batches = []
-        while True:
-            data = self._request.get(self._next_uri)  # pega próximo chunk
-            rows = data.get("data")
 
+        while True:
+            # 1 - baixa a próxima página
+            response = self._request.get(self._next_uri)
+
+            # 2 - interpreta (parseia o JSON)
+            status = self._request.process(response)
+
+            # 3 - atualiza next_uri, stats, columns...
+            self._update_state(status)
+
+            rows = status.rows
             if rows:
                 batch = pa.record_batch(
                     {
@@ -963,8 +971,8 @@ class TrinoQuery:
                 )
                 batches.append(batch)
 
-            self._next_uri = data.get("nextUri")
-            if not self._next_uri:
+            # 4 - se acabou, para
+            if status.next_uri is None:
                 break
 
         return pa.Table.from_batches(batches)
