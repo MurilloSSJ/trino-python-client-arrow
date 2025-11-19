@@ -936,26 +936,38 @@ class TrinoQuery:
         self._warnings = getattr(status, "warnings", [])
 
         rows = status.rows
-
-        batches = []
         if self._fetch_mode == "arrow":
-            mapper = ArrowRowMapper(self._columns)
-            batches.append(mapper.map(rows))
-
-            while not self.finished and not self.cancelled:
-                next_rows = self.fetch()
-                if next_rows is None:
-                    break
-                batches.append(mapper.map(next_rows))
-
-            table = pa.concat_tables(batches)
-            self._result = table
-            return table
-
+            return self.fetch_arrow()
         # modo normal
         mapped = self._row_mapper.map(rows) if self._row_mapper else rows
         self._result = TrinoResult(self, mapped)
         return self._result
+
+    def fetch_arrow(self) -> pa.Table:
+        if self._result is None:
+            self._result = self._fetch_arrow_batches()
+        return self._result
+
+    def _fetch_arrow_batches(self) -> pa.Table:
+        batches = []
+        while True:
+            data = self._request.get(self._next_uri)  # pega próximo chunk
+            rows = data.get("data")
+
+            if rows:
+                batch = pa.record_batch(
+                    {
+                        col["name"]: [row[i] for row in rows]
+                        for i, col in enumerate(self._columns)
+                    }
+                )
+                batches.append(batch)
+
+            self._next_uri = data.get("nextUri")
+            if not self._next_uri:
+                break
+
+        return pa.Table.from_batches(batches)
 
     def _update_state(self, status):
         self._stats.update(status.stats)
