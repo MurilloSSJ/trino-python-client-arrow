@@ -47,7 +47,7 @@ import urllib.parse
 import warnings
 from abc import abstractmethod
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime
 from email.utils import parsedate_to_datetime
@@ -64,7 +64,6 @@ from typing import TypedDict
 from typing import Union
 import pyarrow as pa
 from zoneinfo import ZoneInfo
-
 import lz4.block
 
 try:
@@ -847,20 +846,23 @@ class TrinoResult:
 
 
 class TrinoQuery:
-    """Represent the execution of a SQL statement by Trino."""
+    """Represent the execution of a SQL statement by Trino, supporting several fetch modes including PyArrow Table.
+    Arrow mode can parallelize fetching batches via threading for faster result collection.
+    """
 
     def __init__(
         self,
-        request: TrinoRequest,
+        request: "TrinoRequest",
         query: str,
         legacy_primitive_types: bool = False,
-        fetch_mode: Literal["mapped", "segments"] = "mapped",
+        fetch_mode: Literal["mapped", "segments", "arrow"] = "mapped",
+        max_parallel_arrow_fetch: int = 4,
     ) -> None:
         self._query_id: Optional[str] = None
         self._stats: Dict[Any, Any] = {}
         self._info_uri: Optional[str] = None
         self._warnings: List[Dict[Any, Any]] = []
-        self._columns: Optional[List[str]] = None
+        self._columns: Optional[List[Any]] = None
         self._finished = False
         self._cancelled = False
         self._request = request
@@ -868,10 +870,12 @@ class TrinoQuery:
         self._update_count = None
         self._next_uri = None
         self._query = query
-        self._result: Optional[TrinoResult] = None
+        self._result: Optional[Union[TrinoResult, pa.Table]] = None
         self._legacy_primitive_types = legacy_primitive_types
-        self._row_mapper: Optional[RowMapper] = None
+        self._row_mapper: Optional["RowMapper"] = None
         self._fetch_mode = fetch_mode
+        self._arrow_batches = []  # Buffer for collecting Arrow batches
+        self._max_parallel_arrow_fetch = max_parallel_arrow_fetch
 
     @property
     def query_id(self) -> Optional[str]:
@@ -884,10 +888,18 @@ class TrinoQuery:
     @property
     def columns(self):
         if self.query_id:
-            while not self._columns and not self.finished and not self.cancelled:
-                # Columns are not returned immediately after query is submitted.
-                # Continue fetching data until columns information is available and push fetched rows into buffer.
-                self._result.rows += self.fetch()
+            if self._fetch_mode == "arrow":
+                # For arrow, columns are from the schema if available
+                if self._columns is not None:
+                    return self._columns
+                # Trigger fetch if schema isn't available yet
+                if self._result is None:
+                    self.execute()
+            else:
+                while not self._columns and not self.finished and not self.cancelled:
+                    # Columns are not returned immediately after query is submitted.
+                    # Continue fetching data until columns information is available and push fetched rows into buffer.
+                    self._result.rows += self.fetch()
         return self._columns
 
     @property
@@ -914,13 +926,11 @@ class TrinoQuery:
     def info_uri(self):
         return self._info_uri
 
-    def execute(self, additional_http_headers=None) -> TrinoResult:
+    def execute(self, additional_http_headers=None) -> Union["TrinoResult", pa.Table]:
         """Initiate a Trino query by sending the SQL statement
 
-        This is the first HTTP request sent to the coordinator.
-        It sets the query_id and returns a Result object used to
-        track the rows returned by the query. To fetch all rows,
-        call fetch() until finished is true.
+        This sends the HTTP request, sets query_id, and initializes the result
+        object. Arrow mode will buffer all result pages as Arrow Tables, possibly in parallel.
         """
         if self.cancelled:
             raise exceptions.TrinoUserError("Query has been cancelled", self.query_id)
@@ -940,13 +950,141 @@ class TrinoQuery:
         if status.next_uri is None:
             self._finished = True
 
-        rows = self._row_mapper.map(status.rows) if self._row_mapper else status.rows
-        self._result = TrinoResult(self, rows)
+        if self._fetch_mode == "arrow":
+            # Arrow fetch mode: collect all row pages, convert to a single pyarrow.Table
+            # Now parallelize the fetching with ThreadPoolExecutor
 
-        # Execute should block until at least one row is received or query is finished or cancelled
-        while not self.finished and not self.cancelled and len(self._result.rows) == 0:
-            self._result.rows += self.fetch()
-        return self._result
+            arrow_batches = []
+
+            # Handle first result page synchronously
+            if self._columns and status.rows:
+                batch = self._rows_to_arrow_table(self._columns, status.rows)
+                arrow_batches.append(batch)
+
+            # If query is already finished, return
+            if self.finished or self.cancelled:
+                if arrow_batches:
+                    table = pa.concat_tables(arrow_batches)
+                else:
+                    table = pa.table({})
+                self._result = table
+                return table
+
+            # For simplicity, we'll sequentially fetch next_uri until finished, but using a ThreadPool for actual requests.
+            # Gather all next_uris
+            curr_next_uri = self._next_uri
+            uris = []
+            while not self.finished and not self.cancelled and curr_next_uri:
+                uris.append(curr_next_uri)
+                # Get the next URI sequentially (cannot know in advance all, as Trino uses state machine)
+                # Instead, schedule fetches in parallel as soon as we have a _next_uri, but only up to max_parallel_arrow_fetch in flight
+
+                # Next URI will be updated each fetch so we have to fetch synchronously or pseudo-async, because we don't know all uris ahead.
+                # We'll launch N threads, each fetching one page ahead
+
+                break  # only break for first, will use below batching
+
+            # Instead: Implement batch submission of up to N parallel fetches filling from each available _next_uri as they are discovered.
+            if not self.finished and not self.cancelled:
+                arrow_batches += list(self._par_fetch_arrow_batches())
+
+            if arrow_batches:
+                table = pa.concat_tables(arrow_batches)
+            else:
+                # fallback: empty table
+                table = pa.table({})
+            self._result = table
+            return table
+        else:
+            rows = (
+                self._row_mapper.map(status.rows) if self._row_mapper else status.rows
+            )
+            self._result = TrinoResult(self, rows)
+
+            # Execute should block until at least one row is received or query is finished or cancelled
+            while (
+                not self.finished and not self.cancelled and len(self._result.rows) == 0
+            ):
+                self._result.rows += self.fetch()
+            return self._result
+
+    def _par_fetch_arrow_batches(self):
+        """
+        Paraleliza o download das páginas arrow usando ThreadPoolExecutor.
+        Pega o _next_uri atual e, enquanto não terminar, lança up to max_parallel_arrow_fetch threads.
+        """
+        executor = ThreadPoolExecutor(max_workers=self._max_parallel_arrow_fetch)
+        lock = threading.Lock()
+        batches = []
+
+        # Submitter function - submits new fetches as next_uris become available
+        def submit_fetch(uri):
+            return executor.submit(self._fetch_arrow_and_update, uri)
+
+        while not self.finished and not self.cancelled and self._next_uri:
+            futures = []
+            for _ in range(self._max_parallel_arrow_fetch):
+                with lock:
+                    uri = self._next_uri
+                    if not uri or self.finished or self.cancelled:
+                        break
+                    # Mark current _next_uri as consumed so we don't refetch
+                    self._next_uri = None
+                # Submit fetch job
+                futures.append(submit_fetch(uri))
+
+                # After submit, wait for result and inspect next_uri for more batches
+                finished_count = 0
+                for future in as_completed(futures):
+                    try:
+                        next_batch, next_uri, is_finished = future.result()
+                    except Exception as ex:
+                        executor.shutdown(wait=False)
+                        raise trino.exceptions.TrinoConnectionError(
+                            f"arrow parallel fetch failed: {ex}"
+                        ) from ex
+
+                    if (
+                        next_batch is not None
+                        and isinstance(next_batch, pa.Table)
+                        and next_batch.num_rows > 0
+                    ):
+                        batches.append(next_batch)
+                    with lock:
+                        # Set _next_uri to the next_uri if more pages exist, otherwise mark finished
+                        if next_uri is not None and not is_finished:
+                            self._next_uri = next_uri
+                        else:
+                            self._finished = True
+                    finished_count += 1
+
+            if finished_count == 0:
+                # No more uris fetched
+                break
+
+        executor.shutdown(wait=True)
+        return batches
+
+    def _fetch_arrow_and_update(self, next_uri):
+        """
+        Faz um fetch do next_uri, atualiza o estado, retorna um batch arrow, o próximo next_uri e se terminou.
+        """
+        try:
+            response = self._request.get(next_uri)
+        except requests.exceptions.RequestException as e:
+            raise trino.exceptions.TrinoConnectionError(f"failed to fetch: {e}")
+        status = self._request.process(response)
+        self._update_state(status)
+        if status.next_uri is None:
+            self._finished = True
+        rows = status.rows
+        batch = None
+        if self._fetch_mode == "arrow" and self._columns:
+            if rows:
+                batch = self._rows_to_arrow_table(self._columns, rows)
+            else:
+                batch = None
+        return batch, status.next_uri, self._finished
 
     def _rows_to_arrow_table(self, columns, rows):
         schema = self._columns_to_arrow_schema(columns)
@@ -1007,7 +1145,7 @@ class TrinoQuery:
         self._update_type = status.update_type
         self._update_count = status.update_count
         self._next_uri = status.next_uri
-        if not self._row_mapper and status.columns:
+        if not self._row_mapper and status.columns and self._fetch_mode != "arrow":
             self._row_mapper = RowMapperFactory().create(
                 columns=status.columns,
                 legacy_primitive_types=self._legacy_primitive_types,
@@ -1027,14 +1165,20 @@ class TrinoQuery:
 
         rows = status.rows
         if self._fetch_mode == "arrow" and self._columns:
-            return self._rows_to_arrow_table(self._columns, rows)
+            if rows:
+                return self._rows_to_arrow_table(self._columns, rows)
+            else:
+                # No more rows
+                return None
         elif self._fetch_mode == "segments":
             return self._to_segments(rows)
         else:
             # default mapped mode
             return self._row_mapper.map(rows) if self._row_mapper else rows
 
-    def _to_segments(self, rows: _SpooledProtocolResponseTO) -> List[DecodableSegment]:
+    def _to_segments(
+        self, rows: "_SpooledProtocolResponseTO"
+    ) -> List["DecodableSegment"]:
         encoding = rows["encoding"]
         metadata = rows["metadata"] if "metadata" in rows else None
         segments = []
